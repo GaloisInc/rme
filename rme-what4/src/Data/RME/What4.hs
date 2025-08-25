@@ -1,6 +1,6 @@
 {-# Language LambdaCase, GADTs, ImportQualifiedPost, BlockArguments, TypeFamilies, RankNTypes #-}
 {-|
-Module      : Cryptol.Symbolic.RME
+Module      : Data.RME.What4
 Description : What4 solver adapter for the RME backend.
 Copyright   : (c) 2025 Galois
 License     : BSD3

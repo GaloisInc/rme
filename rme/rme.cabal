@@ -5,8 +5,9 @@ Author:             Galois, Inc.
 Maintainer:         huffman@galois.com
 Build-type:         Simple
 License:            BSD-3-Clause
+extra-doc-files:    CHANGELOG.md
 License-file:       LICENSE
-Copyright:          (c) 2016 Galois Inc.
+Copyright:          (c) 2016-2025 Galois Inc.
 Category:           Formal Methods
 Synopsis:           Reed-Muller Expansion normal form for Boolean Formulas
 Description:

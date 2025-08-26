@@ -1,0 +1,33 @@
+name: rme
+on:
+  push:
+
+jobs:
+  build:
+    name: ${{ matrix.package }} - GHC v${{ matrix.ghc }} - ${{ matrix.os }}
+    strategy:
+      matrix:
+        cabal: ["3.16.0.0"]
+        ghc: ["9.4.8", "9.6.5", "9.8.2"]
+        os: ["ubuntu-24.04"]
+        package:
+          - rme
+          - rme-what4
+      fail-fast: false
+    uses: GaloisInc/.github/.github/workflows/haskell-ci.yml@v1
+    with:
+      build-targets: ${{ matrix.package }}
+      cabal: ${{ matrix.cabal }}
+      # The numeric prefix can be updated to force the use of a new cache if
+      # the current cache contents become corrupted/invalid.  This can
+      # sometimes happen when (for example) the OS version is changed but
+      # older .so files are cached, which can have various effects
+      # (e.g. cabal complains it can't find a valid version of the "happy"
+      # tool).
+      cache-key-prefix: 1
+      # See Note [Parallelism] in `haskell-ci.yml` for why `--ghc-options='-j'`
+      # and `--semaphore`.
+      configure-flags: --enable-tests --ghc-options='-Werror=compat -Werror=default -j' --semaphore
+      ghc: ${{ matrix.ghc }}
+      os: ${{ matrix.os }}
+      sdist-targets: ${{ matrix.package }}

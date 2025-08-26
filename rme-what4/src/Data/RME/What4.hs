@@ -206,7 +206,19 @@ evalExpr = \case
         BV.BV ci -> pure $! integer w ci
   W4.FloatExpr{} -> fail "RME does not support floating point numbers"
   W4.StringExpr{} -> fail "RME does not support string literals"
-  W4.NonceAppExpr{} -> fail "RME does not support quantifiers"
+  W4.NonceAppExpr x -> cached (W4.nonceExprId x) (evalNonceApp (W4.nonceExprApp x))
+
+-- | Evaluate a NonceApp expression. In most cases this will result in
+-- failure with a message explaining what feature was unsupported.
+evalNonceApp :: W4.NonceApp t (W4.Expr t) tp -> M t (R tp)
+evalNonceApp = \case
+  W4.Annotation _ _ e -> evalExpr e
+  W4.Forall{} -> fail "RME does not support 'Forall' quantifiers"
+  W4.Exists{} -> fail "RME does not support 'Exists' quantifiers"
+  W4.ArrayFromFn{} -> fail "RME does not support symbolic 'ArrayFromFn' expressions"
+  W4.MapOverArrays{} -> fail "RME does not support symbolic 'MapOverArrays' expressions"
+  W4.ArrayTrueOnEntries{} -> fail "RME does not support symbolic 'ArrayTrueOnEntries' expressions"
+  W4.FnApp{} -> fail "RME does not support symbolic 'FnApp' expressions"
 
 -- | Allocates an unconstrainted RME term at the given type.
 allocateVar :: RMERepr tp -> M t (R tp)

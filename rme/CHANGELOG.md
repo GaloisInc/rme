@@ -1,4 +1,4 @@
-# Revision history for rme-what4
+# Revision history for rme
 
 ## 0.1 -- TBA
 

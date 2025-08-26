@@ -5,6 +5,7 @@ Author:             Galois, Inc.
 Maintainer:         huffman@galois.com
 Build-type:         Simple
 License:            BSD-3-Clause
+extra-doc-files:    CHANGELOG.md
 License-file:       LICENSE
 Copyright:          (c) 2016 Galois Inc.
 Category:           Formal Methods

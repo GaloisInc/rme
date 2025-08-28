@@ -1,4 +1,4 @@
-{-# Language LambdaCase, GADTs, ImportQualifiedPost, BlockArguments, TypeFamilies, RankNTypes, PatternSynonyms, TypeOperators #-}
+{-# Language LambdaCase, GADTs, ImportQualifiedPost, BlockArguments, TypeFamilies, RankNTypes, PatternSynonyms, TypeOperators, MonadComprehensions #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-|
 Module      : Data.RME.What4
@@ -24,6 +24,7 @@ import Data.IntSet qualified as IntSet
 import Data.Parameterized (TestEquality(..), TraversableFC(..), (::>), OrdF (compareF), OrderingF (..), type (:~:)(Refl), lexCompareF, joinOrderingF, fromOrdering, Pair (Pair))
 import Data.Parameterized.Context (Assignment, pattern Empty, pattern (:>))
 import Data.Parameterized.Context qualified as Ctx
+import Data.Parameterized.Map (MapF)
 import Data.Parameterized.Map qualified as MapF
 import Data.Parameterized.NatRepr ( NatRepr(..) )
 import Data.Parameterized.Nonce qualified as Nonce
@@ -68,11 +69,9 @@ rmeAdapterCheckSat _ logger asserts k =
           Nothing -> k (W4.Unsat ())
           Just model ->
            do let trueVars = IntSet.fromList [i | (i, True) <- model]
-              let evaluate :: W4.Expr t tp -> IO (W4.GroundValue tp)
-                  evaluate = groundEval trueVars (nonceCache s)
-            
+                  evaluate = W4.GroundEvalFn (groundEval trueVars (nonceCache s))
               if checkConsistent trueVars MapF.empty (MapF.toList (abstracts s))
-                then k (W4.Sat (W4.GroundEvalFn evaluate, Nothing))
+                then k (W4.Sat (evaluate, Nothing))
                 else k Unknown
 
 -- | The checks whether the point-wise definition of a symbolic function
@@ -84,17 +83,18 @@ rmeAdapterCheckSat _ logger asserts k =
 -- if `a` and `b` might eventually be equal.
 checkConsistent ::
   IntSet {- ^ Variables assigned true in the satisfying model -} ->
-  MapF.MapF (ConcreteKey t) W4.GroundValueWrapper {- ^ Summary of previously checked function points -} ->
+  MapF (ConcreteKey t) W4.GroundValueWrapper {- ^ Summary of previously checked function points -} ->
   [Pair (AbstractKey t) R'] {- ^ List of defined points in the function -} ->
   Bool
 checkConsistent _ _ [] = True
 checkConsistent trueVars seen (Pair (AbstractKey f argTys retTy args) v : rest) =
   case MapF.lookup k' seen of
-    Nothing -> checkConsistent trueVars (MapF.insert k' v' seen) rest
+    Nothing -> checkConsistent trueVars seen' rest
     Just old -> same retTy old v' && checkConsistent trueVars seen rest
   where
     k' = ConcreteKey f argTys (Ctx.zipWith (evalR trueVars) argTys args)
     v' = evalR trueVars retTy v
+    seen' = MapF.insert k' v' seen
 
     same :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Bool
     same BitRepr (W4.GVW x) (W4.GVW y) = x == y
@@ -102,29 +102,27 @@ checkConsistent trueVars seen (Pair (AbstractKey f argTys retTy args) v : rest) 
 
 -- | Given a satisfying model compute the ground value of an RME term.
 evalR :: IntSet -> RMERepr a -> R' a -> W4.GroundValueWrapper a
-evalR trueVars BitRepr (R x) = W4.GVW (eval x (`IntSet.member` trueVars))
-evalR trueVars (BVRepr w) (R x) = W4.GVW (BV.mkBV w (bitsToInteger (fmap (`eval` (`IntSet.member` trueVars)) x)))
+evalR trueVars BitRepr (R x) = W4.GVW (evalRME trueVars x)
+evalR trueVars (BVRepr w) (R x) = W4.GVW (bitsToBV w (fmap (evalRME trueVars) x))
 
--- | Compute the integer corresponding to the argument treated as a big-endian unsigned integer.
-bitsToInteger :: V.Vector Bool -> Integer
-bitsToInteger = foldl (\acc x -> if x then acc*2 else acc*2+1) 0
+-- | Evaluate an RME term given the set of true variables.
+evalRME :: IntSet -> RME -> Bool
+evalRME trueVars x = eval x (`IntSet.member` trueVars)
 
 -- | Ground evaluation function. Given a satisfying assignment (set of true variables)
 -- this function will used the cached results to evaluate an expression.
-groundEval :: IntSet -> MapF.MapF (Nonce.Nonce t) R' -> W4.Expr t tp -> IO (W4.GroundValue tp)
+groundEval :: IntSet -> MapF (Nonce.Nonce t) R' -> W4.Expr t tp -> IO (W4.GroundValue tp)
 groundEval trueVars nonces e =
-  let t = W4.exprType e
-      ev x = eval x (`IntSet.member` trueVars)
-  in
-  case flip MapF.lookup nonces =<< W4.exprMaybeId e of
-    Just (R n)
-      | W4.BaseBoolRepr <- t -> pure $! ev n
-      | W4.BaseBVRepr w <- t -> pure $! bitsToBV w (fmap ev n)
+  case (flip MapF.lookup nonces =<< W4.exprMaybeId e, W4.exprType e) of
+    (Just (R n), W4.BaseBoolRepr) -> pure $! evalRME trueVars n
+    (Just (R n), W4.BaseBVRepr w) -> pure $! bitsToBV w (fmap (evalRME trueVars) n)
     _ -> W4.evalGroundExpr (groundEval trueVars nonces) e
 
-bitsToBV :: Foldable f => NatRepr w -> f Bool -> BV.BV w
+-- | Build a 'BV' from a vector of booleans.
+bitsToBV :: NatRepr w -> V.Vector Bool -> BV.BV w
 bitsToBV w bs = BV.mkBV w (foldl (\acc x -> if x then 1 + acc*2 else acc*2) 0 bs)
 
+-- | Evaluation is run in a context with a state, an error continuation, and a success continuation.
 newtype M t a = M { unM :: forall k. S t -> (String -> k) -> (a -> S t -> k) -> k }
 
 runM :: M t a -> Either String (a, S t)
@@ -154,10 +152,11 @@ set s = M (\_ _ t -> t () s)
 -- | The state of evaluating an Expr into an RME term
 data S t = S
   { nextVar :: !Int -- ^ next fresh variable to be used with RME lit
-  , nonceCache :: !(MapF.MapF (Nonce.Nonce t) R') -- ^ previously translated w4 expressions
-  , abstracts :: !(MapF.MapF (AbstractKey t) R')
+  , nonceCache :: !(MapF (Nonce.Nonce t) R') -- ^ previously translated w4 expressions
+  , abstracts :: !(MapF (AbstractKey t) R') -- ^ previously assigned function applications
   }
 
+-- | The application of a symbolic function to arguments in the RME domain.
 data AbstractKey t ret where
   AbstractKey ::
     Nonce.Nonce t (args ::> ret) ->
@@ -168,31 +167,29 @@ data AbstractKey t ret where
 
 instance TestEquality (AbstractKey t) where
   testEquality (AbstractKey f ts_ _ xs_) (AbstractKey g _ _ ys_) =
-   do Refl <- testEquality f g
-      Refl <- go ts_ xs_ ys_
-      Just Refl
+    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_]
     where
+      same :: RMERepr a -> R a -> R a -> Bool
+      same BitRepr = (==)
+      same BVRepr{} = (==)
+
       go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Maybe (a :~: a)
       go Empty Empty Empty = Just Refl
-      go (ts :> BitRepr) (xs :> R x) (ys :> R y) | x == y =
-       do Refl <- go ts xs ys
-          Just Refl
-      go (ts :> BVRepr _) (xs :> R x) (ys :> R y) | x == y =
-       do Refl <- go ts xs ys
-          Just Refl
-      go _ _ _ = Nothing
+      go (ts :> t) (xs :> R x) (ys :> R y) = [Refl | same t x y, Refl <- go ts xs ys]
 
 instance OrdF (AbstractKey t) where
   compareF (AbstractKey f ts_ _ xs_) (AbstractKey g _ _ ys_) =
     lexCompareF f g (joinOrderingF (go ts_ xs_ ys_) EQF)
     where
+      same :: RMERepr a -> R a -> R a -> OrderingF a a
+      same BitRepr x y = fromOrdering (compare x y)
+      same BVRepr{} x y = fromOrdering (compare x y)
+
       go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> OrderingF a a
       go Empty Empty Empty = EQF
-      go (ts :> BitRepr) (xs :> R x) (ys :> R y) =
-        joinOrderingF (fromOrdering (compare x y)) (joinOrderingF (go ts xs ys) EQF)
-      go (ts :> BVRepr _) (xs :> R x) (ys :> R y) =
-        joinOrderingF (fromOrdering (compare x y)) (joinOrderingF (go ts xs ys) EQF)
+      go (ts :> t) (xs :> R x) (ys :> R y) = joinOrderingF (same t x y) (joinOrderingF (go ts xs ys) EQF)
 
+-- | The application of a symbolic function to concrete arguments.
 data ConcreteKey t ret where
   ConcreteKey ::
     Nonce.Nonce t (args ::> ret) ->
@@ -202,30 +199,27 @@ data ConcreteKey t ret where
 
 instance TestEquality (ConcreteKey t) where
   testEquality (ConcreteKey f ts_ xs_) (ConcreteKey g _ ys_) =
-   do Refl <- testEquality f g
-      Refl <- go ts_ xs_ ys_
-      Just Refl
+    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_]
     where
+      same :: RMERepr a -> W4.GroundValue a -> W4.GroundValue a -> Bool
+      same BitRepr = (==)
+      same BVRepr{} = (==)
+
       go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Maybe (a :~: a)
       go Empty Empty Empty = Just Refl
-      go (ts :> BitRepr) (xs :> W4.GVW x) (ys :> W4.GVW y) | x == y =
-       do Refl <- go ts xs ys
-          Just Refl
-      go (ts :> BVRepr _) (xs :> W4.GVW x) (ys :> W4.GVW y) | x == y =
-       do Refl <- go ts xs ys
-          Just Refl
-      go _ _ _ = Nothing
+      go (ts :> t) (xs :> W4.GVW x) (ys :> W4.GVW y) = [Refl | same t x y, Refl <- go ts xs ys]
 
 instance OrdF (ConcreteKey t) where
   compareF (ConcreteKey f ts_ xs_) (ConcreteKey g _ ys_) =
     lexCompareF f g (joinOrderingF (go ts_ xs_ ys_) EQF)
     where
+      same :: RMERepr a -> W4.GroundValue a -> W4.GroundValue a -> OrderingF a a
+      same BitRepr x y = fromOrdering (compare x y)
+      same BVRepr{} x y = fromOrdering (compare x y)
+
       go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> OrderingF a a
       go Empty Empty Empty = EQF
-      go (ts :> BitRepr) (xs :> W4.GVW x) (ys :> W4.GVW y) =
-        joinOrderingF (fromOrdering (compare x y)) (joinOrderingF (go ts xs ys) EQF)
-      go (ts :> BVRepr _) (xs :> W4.GVW x) (ys :> W4.GVW y) =
-        joinOrderingF (fromOrdering (compare x y)) (joinOrderingF (go ts xs ys) EQF)
+      go (ts :> t) (xs :> W4.GVW x) (ys :> W4.GVW y) = joinOrderingF (same t x y) (joinOrderingF (go ts xs ys) EQF)
 
 -- | The initial evaluation state
 emptyS :: S t

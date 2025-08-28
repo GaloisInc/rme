@@ -1,6 +1,6 @@
 Cabal-version:      3.0
 Name:               rme
-Version:            0.1
+Version:            0.1.1
 Author:             Galois, Inc.
 Maintainer:         huffman@galois.com
 Build-type:         Simple

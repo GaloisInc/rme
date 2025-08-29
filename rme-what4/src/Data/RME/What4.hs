@@ -76,7 +76,7 @@ rmeAdapterCheckSat _ logger asserts k =
                 then k (W4.Sat (evaluate, Nothing))
                 else k Unknown
 
--- | The checks whether the point-wise definition of a symbolic function
+-- | The checks whether the point-wise definition of an uninterpreted function
 -- was actually consistent in a satisfying model. It is possible that a
 -- function can have different outputs for the same concrete inputs.
 --
@@ -158,7 +158,7 @@ data S t = S
   , abstracts :: !(MapF (AbstractKey t) R') -- ^ previously assigned function applications
   }
 
--- | The application of a symbolic function to arguments in the RME domain.
+-- | The application of a uninterpreted function to arguments in the RME domain.
 data AbstractKey t ret where
   AbstractKey ::
     Nonce.Nonce t (args ::> ret) ->
@@ -192,7 +192,7 @@ instance OrdF (AbstractKey t) where
       go Empty Empty Empty = EQF
       go (ts :> t) (xs :> R x) (ys :> R y) = joinOrderingF (same t x y) (joinOrderingF (go ts xs ys) EQF)
 
--- | The application of a symbolic function to concrete arguments.
+-- | The application of a uninterpreted function to concrete arguments.
 data ConcreteKey t ret where
   ConcreteKey ::
     Nonce.Nonce t (args ::> ret) ->
@@ -325,9 +325,9 @@ evalNonceApp = \case
   W4.Annotation _ _ e -> evalExpr e
   W4.Forall{} -> fail "RME does not support 'Forall' quantifiers"
   W4.Exists{} -> fail "RME does not support 'Exists' quantifiers"
-  W4.ArrayFromFn{} -> fail "RME does not support symbolic 'ArrayFromFn' expressions"
-  W4.MapOverArrays{} -> fail "RME does not support symbolic 'MapOverArrays' expressions"
-  W4.ArrayTrueOnEntries{} -> fail "RME does not support symbolic 'ArrayTrueOnEntries' expressions"
+  W4.ArrayFromFn{} -> fail "RME does not support uninterpreted 'ArrayFromFn' expressions"
+  W4.MapOverArrays{} -> fail "RME does not support uninterpreted 'MapOverArrays' expressions"
+  W4.ArrayTrueOnEntries{} -> fail "RME does not support uninterpreted 'ArrayTrueOnEntries' expressions"
   W4.FnApp fn args ->
    do args' <- traverseFC (\x -> R <$> evalExpr x) args
       argTypes <- traverseFC evalTypeRepr (W4.symFnArgTypes fn)

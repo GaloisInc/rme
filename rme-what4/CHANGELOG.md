@@ -2,7 +2,7 @@
 
 ## 0.1.1
 
-* Added support for symbolic functions
+* Added support for uninterpreted functions
 
 ## 0.1 -- TBA
 

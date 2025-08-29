@@ -1,4 +1,4 @@
-{-# Language LambdaCase, GADTs, ImportQualifiedPost, BlockArguments, TypeFamilies, RankNTypes #-}
+{-# LANGUAGE GADTs, TypeFamilies, ScopedTypeVariables #-}
 {-|
 Module      : Data.RME.What4
 Description : What4 solver adapter for the RME backend.
@@ -18,24 +18,32 @@ module Data.RME.What4 (rmeAdapter) where
 
 import Control.Monad (replicateM, ap, (<$!>))
 import Data.BitVector.Sized qualified as BV
+import Data.Foldable (msum)
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
+import Data.Map (Map)
+import Data.Map qualified as Map
+import Data.Parameterized (traverseFC, (::>), Some (..))
+import Data.Parameterized.Context (Assignment, pattern Empty, pattern (:>))
+import Data.Parameterized.Context qualified as Ctx
+import Data.Parameterized.Map (MapF)
 import Data.Parameterized.Map qualified as MapF
 import Data.Parameterized.NatRepr ( NatRepr(..) )
-import Data.Parameterized.Nonce qualified as Nonce
+import Data.Parameterized.Nonce (Nonce)
 import Data.RME
 import Data.Vector qualified as V
 import What4.Expr.App qualified as W4
 import What4.Expr.BoolMap qualified as W4
 import What4.Expr.Builder qualified as W4
 import What4.Expr.GroundEval qualified as W4
-import What4.Expr.WeightedSum qualified as Sum
 import What4.Expr.UnaryBV qualified as UnaryBV
+import What4.Expr.WeightedSum qualified as Sum
 import What4.Interface qualified as W4
 import What4.SatResult qualified as W4
 import What4.SemiRing qualified as W4
 import What4.Solver
 
+-- | Adapter for @rme@ package based satisfiability checker.
 rmeAdapter :: SolverAdapter st
 rmeAdapter =
   SolverAdapter
@@ -45,10 +53,12 @@ rmeAdapter =
   , solver_adapter_write_smt2 = \_ _ _ -> pure ()
   }
 
+-- | Satisfiability checker using 'RME' representation.
 rmeAdapterCheckSat ::
+  forall t st fs a.
   W4.ExprBuilder t st fs ->
   LogData ->
-  [W4.BoolExpr t] ->
+  [W4.BoolExpr t] {- ^ list of assertions -} ->
   (SatResult (W4.GroundEvalFn t, Maybe (ExprRangeBindings t)) () -> IO a) ->
   IO a
 rmeAdapterCheckSat _ logger asserts k =
@@ -60,28 +70,146 @@ rmeAdapterCheckSat _ logger asserts k =
           putStrLn e
           k W4.Unknown
       Right (rme, s) ->
-        case sat rme of
-          Nothing -> k (W4.Unsat ())
-          Just model ->
-            let trueVars = IntSet.fromList [i | (i, True) <- model]
-            in k (W4.Sat (W4.GroundEvalFn (groundEval trueVars (nonceCache s)), Nothing))
+        k case cegar rme (uninterps s) of
+          Nothing -> Unsat ()
+          Just trueVars ->
+            W4.Sat (W4.GroundEvalFn (groundEval trueVars (nonceCache s)), Nothing)
+
+-- | Counter-example guided abstraction refinement
+--
+-- Given an RME term, compute a satisfying assigment for that term.
+-- Then check that the satisfying assignment generates
+cegar :: RME -> MapF (Nonce t) UninterpFnData -> Maybe IntSet
+cegar rme a =
+  case sat rme of
+    Nothing -> Nothing
+    Just model ->
+      let trueVars = IntSet.fromList [x | (x, True) <- model] in
+      case msum (fmap (findRefinement trueVars) (MapF.elems a)) of
+        Nothing -> Just trueVars
+        Just refinement -> cegar (conj refinement rme) a
+
+-- | Search for a contradiction in the chosen interpretation of an
+-- uninterpreted function. Each of the points at which the function
+-- was defined are computed to ground values. If there is a contradiction
+-- in the current model for a pair of points, an RME term is returned
+-- that should have been true in a valid model.
+findRefinement ::
+  IntSet {- ^ Variables assigned true in the satisfying model -} ->
+  Some UninterpFnData {- ^ Defined points in the function -} ->
+  Maybe RME
+findRefinement trueVars (Some (UninterpFnData retT points)) = go Map.empty (Map.toList points)
+  where
+    go _ [] = Nothing
+    go seen ((AbstractKey argTs k, v) : rest) =
+      case Map.lookup k' seen of
+        Nothing -> go seen' rest
+        Just (old_k, old_v, old_v')
+          | gvwEq retT old_v' v' -> go seen rest
+          | otherwise -> Just (makeRefinement argTs old_k k retT old_v v)
+        where
+          k' = ConcreteKey argTs (Ctx.zipWith (evalR trueVars) argTs k)
+          v' = evalR trueVars retT v
+          seen' = Map.insert k' (k, v, v') seen
+
+-- | Equality of two ground value terms.
+gvwEq :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Bool
+gvwEq BitRepr (W4.GVW x) (W4.GVW y) = x == y
+gvwEq BVRepr{} (W4.GVW x) (W4.GVW y) = x == y
+
+-- | Literal equality of the symbolic boolean formulas. Two RME values
+-- are considered equal when they compute the same expression under all
+-- interpretations. Because RME keeps terms in a normal for, we can use
+-- derived equality to answer this question.
+rmeEq :: RMERepr a -> R' a -> R' a -> Bool
+rmeEq BitRepr (R x) (R y) = x == y
+rmeEq BVRepr{} (R x) (R y) = x == y
+
+data AbstractKey args where
+  AbstractKey ::
+    Assignment RMERepr args ->
+    Assignment R' args ->
+    AbstractKey args
+
+instance Eq (AbstractKey args) where
+  AbstractKey a b == AbstractKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Bool
+      go Empty Empty Empty = True
+      go (ts :> t) (xs :> x) (ys :> y) = rmeEq t x y && go ts xs ys
+
+instance Ord (AbstractKey args) where
+  AbstractKey a b `compare` AbstractKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Ordering
+      go Empty Empty Empty = EQ
+      go (ts :> t) (xs :> x) (ys :> y) = compareR t x y <> go ts xs ys
+
+      compareR :: RMERepr a -> R' a -> R' a -> Ordering
+      compareR BitRepr (R x) (R y) = compare x y
+      compareR BVRepr{} (R x) (R y) = compare x y
+
+data ConcreteKey args where
+  ConcreteKey ::
+    Assignment RMERepr args ->
+    Assignment W4.GroundValueWrapper args ->
+    ConcreteKey args
+
+instance Eq (ConcreteKey args) where
+  ConcreteKey a b == ConcreteKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Bool
+      go Empty Empty Empty = True
+      go (ts :> t) (xs :> x) (ys :> y) = gvwEq t x y && go ts xs ys
+
+instance Ord (ConcreteKey args) where
+  ConcreteKey a b `compare` ConcreteKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Ordering
+      go Empty Empty Empty = EQ
+      go (ts :> t) (xs :> x) (ys :> y) = compareGVW t x y <> go ts xs ys
+
+      compareGVW :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Ordering
+      compareGVW BitRepr (W4.GVW x) (W4.GVW y) = compare x y
+      compareGVW BVRepr{} (W4.GVW x) (W4.GVW y) = compare x y
+
+makeRefinement ::
+  Assignment RMERepr a -> Assignment R' a -> Assignment R' a ->
+  RMERepr r -> R' r -> R' r ->
+  RME
+makeRefinement Empty Empty Empty rt rx ry = sameR rt rx ry
+makeRefinement (ts :> t) (xs :> x) (ys :> y) rt rx ry = sameR t x y ==> makeRefinement ts xs ys rt rx ry
+  where
+    p ==> q = compl p `disj` q
+
+-- | Computes the symbolic term that is true when the two arguments are equal
+sameR :: RMERepr a -> R' a -> R' a -> RME
+sameR BitRepr (R l) (R r) = conj l r
+sameR BVRepr{} (R l) (R r) = eq l r
+
+-- | Given a satisfying model, compute the ground value of an RME term.
+evalR :: IntSet -> RMERepr a -> R' a -> W4.GroundValueWrapper a
+evalR trueVars BitRepr (R x) = W4.GVW (evalRME trueVars x)
+evalR trueVars (BVRepr w) (R x) = W4.GVW (bitsToBV w (fmap (evalRME trueVars) x))
+
+-- | Evaluate an RME term given the set of true variables.
+evalRME :: IntSet -> RME -> Bool
+evalRME trueVars x = eval x (`IntSet.member` trueVars)
 
 -- | Ground evaluation function. Given a satisfying assignment (set of true variables)
 -- this function will used the cached results to evaluate an expression.
-groundEval :: IntSet -> MapF.MapF (Nonce.Nonce t) SomeR -> W4.Expr t tp -> IO (W4.GroundValue tp)
+groundEval :: IntSet -> MapF (Nonce t) R' -> W4.Expr t tp -> IO (W4.GroundValue tp)
 groundEval trueVars nonces e =
-  let t = W4.exprType e
-      ev x = eval x (`IntSet.member` trueVars)
-  in
-  case flip MapF.lookup nonces =<< W4.exprMaybeId e of
-    Just (SomeR n)
-      | W4.BaseBoolRepr <- t -> pure $! ev n
-      | W4.BaseBVRepr w <- t -> pure $! bitsToBV w (fmap ev n)
+  case (flip MapF.lookup nonces =<< W4.exprMaybeId e, W4.exprType e) of
+    (Just (R n), W4.BaseBoolRepr) -> pure $! evalRME trueVars n
+    (Just (R n), W4.BaseBVRepr w) -> pure $! bitsToBV w (fmap (evalRME trueVars) n)
     _ -> W4.evalGroundExpr (groundEval trueVars nonces) e
 
-bitsToBV :: Foldable f => NatRepr w -> f Bool -> BV.BV w
+-- | Build a 'BV.BV' from a vector of booleans.
+bitsToBV :: NatRepr w -> V.Vector Bool -> BV.BV w
 bitsToBV w bs = BV.mkBV w (foldl (\acc x -> if x then 1 + acc*2 else acc*2) 0 bs)
 
+-- | Evaluation is run in a context with a state, an error continuation, and a success continuation.
 newtype M t a = M { unM :: forall k. S t -> (String -> k) -> (a -> S t -> k) -> k }
 
 runM :: M t a -> Either String (a, S t)
@@ -108,17 +236,26 @@ get = M (\s _ t -> t s s)
 set :: S t -> M t ()
 set s = M (\_ _ t -> t () s)
 
--- | The state of evaluating an Expr into an RME term
+-- | The state of evaluating an 'Expr' into an 'RME' term
 data S t = S
   { nextVar :: !Int -- ^ next fresh variable to be used with RME lit
-  , nonceCache :: !(MapF.MapF (Nonce.Nonce t) SomeR) -- ^ previously translated w4 expressions
+  , nonceCache :: !(MapF (Nonce t) R') -- ^ previously translated w4 expressions
+  , uninterps :: !(MapF (Nonce t) UninterpFnData) -- ^ uninterpreted function interpretations
   }
+
+-- | Type-information and point-wise definition of an uninterpreted function.
+data UninterpFnData tp where
+  UninterpFnData ::
+    RMERepr ret ->
+    Map (AbstractKey args) (R' ret) ->
+    UninterpFnData (args ::> ret)
 
 -- | The initial evaluation state
 emptyS :: S t
 emptyS = S
   { nextVar = 0
   , nonceCache = MapF.empty
+  , uninterps = MapF.empty
   }
 
 -- | Produce a fresh RME term
@@ -136,28 +273,28 @@ type family R (t :: W4.BaseType) where
   R W4.BaseBoolType = RME
   R (W4.BaseBVType n) = RMEV
 
--- | Newtype wrapper for 'R' type for use with 'MapF'
-newtype SomeR tp = SomeR (R tp)
+-- | Newtype wrapper for the 't:R' type family for use with 'Assignment'
+newtype R' tp = R (R tp)
 
 -- | Representation type use to determine which RME representation is being used
 data RMERepr (t :: W4.BaseType) where
   -- | A single RME bit
   BitRepr :: RMERepr W4.BaseBoolType
   -- | A vector of w RME bits
-  BVRepr  :: !Int -> RMERepr (W4.BaseBVType w)
+  BVRepr  :: !(NatRepr w) -> RMERepr (W4.BaseBVType w)
 
 -- | Helper for memoizing evaluation. Given a nonced and a way to evaluation
 -- action this will either return the cached value for that nonce or
 -- evaluate the given action and store it in the cache before returning it.
-cached :: Nonce.Nonce t tp -> M t (R tp) -> M t (R tp)
+cached :: Nonce t tp -> M t (R tp) -> M t (R tp)
 cached nonce gen =
  do mb <- fmap (MapF.lookup nonce . nonceCache) get
     case mb of
-      Just (SomeR r) -> pure r
+      Just (R r) -> pure r
       Nothing ->
        do r <- gen
           s <- get
-          set s{ nonceCache = MapF.insert nonce (SomeR r) (nonceCache s) }
+          set $! s{ nonceCache = MapF.insert nonce (R r) (nonceCache s) }
           pure r
 
 -- | A version of what4's SemiRingRepr that matches the semi-rings that this backend supports
@@ -179,9 +316,7 @@ evalWidth w =
 evalTypeRepr :: W4.BaseTypeRepr tp -> M t (RMERepr tp)
 evalTypeRepr = \case
   W4.BaseBoolRepr -> pure BitRepr
-  W4.BaseBVRepr w ->
-   do w' <- evalWidth w
-      pure $! BVRepr w'
+  W4.BaseBVRepr w -> pure $! BVRepr w
   r -> fail ("RME does not support " ++ show r)
 
 -- | Convert a generic what4 semiring type to an RME semiring type.
@@ -215,16 +350,39 @@ evalNonceApp = \case
   W4.Annotation _ _ e -> evalExpr e
   W4.Forall{} -> fail "RME does not support 'Forall' quantifiers"
   W4.Exists{} -> fail "RME does not support 'Exists' quantifiers"
-  W4.ArrayFromFn{} -> fail "RME does not support symbolic 'ArrayFromFn' expressions"
-  W4.MapOverArrays{} -> fail "RME does not support symbolic 'MapOverArrays' expressions"
-  W4.ArrayTrueOnEntries{} -> fail "RME does not support symbolic 'ArrayTrueOnEntries' expressions"
-  W4.FnApp{} -> fail "RME does not support symbolic 'FnApp' expressions"
+  W4.ArrayFromFn{} -> fail "RME does not support 'ArrayFromFn' expressions"
+  W4.MapOverArrays{} -> fail "RME does not support 'MapOverArrays' expressions"
+  W4.ArrayTrueOnEntries{} -> fail "RME does not support 'ArrayTrueOnEntries' expressions"
+  W4.FnApp fn args ->
+   do args' <- traverseFC (\x -> R <$> evalExpr x) args
+      argTypes <- traverseFC evalTypeRepr (W4.symFnArgTypes fn)
+      retType <- evalTypeRepr (W4.symFnReturnType fn)
+      let nonce = W4.symFnId fn
+      let key = AbstractKey argTypes args'
+      mbOldFnData <- fmap (MapF.lookup nonce . uninterps) get
+
+      -- Allocate a new point in the uninterpreted function and add it to the existing ones
+      let allocatePoint points =
+           do r <- allocateVar =<< evalTypeRepr (W4.symFnReturnType fn)
+              s <- get
+              let newFnData = UninterpFnData retType (Map.insert key (R r) points)
+              set $! s{ uninterps = MapF.insert nonce newFnData (uninterps s) }
+              pure r
+
+      case mbOldFnData of
+        Just (UninterpFnData _ points) ->
+          case Map.lookup key points of
+            Just (R ret) -> pure ret
+            Nothing -> allocatePoint points
+        Nothing -> allocatePoint Map.empty
 
 -- | Allocates an unconstrainted RME term at the given type.
 allocateVar :: RMERepr tp -> M t (R tp)
 allocateVar = \case
   BitRepr -> freshRME
-  BVRepr w -> V.fromList <$!> replicateM w freshRME
+  BVRepr w ->
+   do w' <- evalWidth w
+      V.fromList <$!> replicateM w' freshRME
 
 -- | Convert a what4 App into an RME term for the operations that the
 -- RME backend supports.

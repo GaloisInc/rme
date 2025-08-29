@@ -29,7 +29,7 @@ module Data.RME.Base
 -- go deeper in the tree.
 
 data RME = Node !Int !RME !RME | R0 | R1
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 -- | Evaluate formula with given variable assignment.
 eval :: RME -> (Int -> Bool) -> Bool

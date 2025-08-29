@@ -18,6 +18,7 @@ module Data.RME.What4 (rmeAdapter) where
 
 import Control.Monad (replicateM, ap, (<$!>))
 import Data.BitVector.Sized qualified as BV
+import Data.Foldable (msum)
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
 import Data.Map (Map)
@@ -41,8 +42,8 @@ import What4.Interface qualified as W4
 import What4.SatResult qualified as W4
 import What4.SemiRing qualified as W4
 import What4.Solver
-import Data.Foldable (msum)
 
+-- | Adapter for @rme@ package based satisfiability checker.
 rmeAdapter :: SolverAdapter st
 rmeAdapter =
   SolverAdapter
@@ -52,11 +53,12 @@ rmeAdapter =
   , solver_adapter_write_smt2 = \_ _ _ -> pure ()
   }
 
+-- | Satisfiability checker using 'RME' representation.
 rmeAdapterCheckSat ::
   forall t st fs a.
   W4.ExprBuilder t st fs ->
   LogData ->
-  [W4.BoolExpr t] ->
+  [W4.BoolExpr t] {- ^ list of assertions -} ->
   (SatResult (W4.GroundEvalFn t, Maybe (ExprRangeBindings t)) () -> IO a) ->
   IO a
 rmeAdapterCheckSat _ logger asserts k =
@@ -68,11 +70,10 @@ rmeAdapterCheckSat _ logger asserts k =
           putStrLn e
           k W4.Unknown
       Right (rme, s) ->
-        case cegar rme (abstracts s) of
-          Nothing -> k (Unsat ())
+        k case cegar rme (uninterps s) of
+          Nothing -> Unsat ()
           Just trueVars ->
-           do let evaluate = W4.GroundEvalFn (groundEval trueVars (nonceCache s))
-              k (W4.Sat (evaluate, Nothing))
+            W4.Sat (W4.GroundEvalFn (groundEval trueVars (nonceCache s)), Nothing)
 
 -- | Counter-example guided abstraction refinement
 --
@@ -97,10 +98,10 @@ findRefinement ::
   IntSet {- ^ Variables assigned true in the satisfying model -} ->
   Some UninterpFnData {- ^ Defined points in the function -} ->
   Maybe RME
-findRefinement trueVars (Some (UninterpFnData argTs retT points)) = go Map.empty (Map.toList points)
+findRefinement trueVars (Some (UninterpFnData retT points)) = go Map.empty (Map.toList points)
   where
     go _ [] = Nothing
-    go seen ((AbstractKey _ k, v) : rest) =
+    go seen ((AbstractKey argTs k, v) : rest) =
       case Map.lookup k' seen of
         Nothing -> go seen' rest
         Just (old_k, old_v, old_v')
@@ -204,7 +205,7 @@ groundEval trueVars nonces e =
     (Just (R n), W4.BaseBVRepr w) -> pure $! bitsToBV w (fmap (evalRME trueVars) n)
     _ -> W4.evalGroundExpr (groundEval trueVars nonces) e
 
--- | Build a 'BV' from a vector of booleans.
+-- | Build a 'BV.BV' from a vector of booleans.
 bitsToBV :: NatRepr w -> V.Vector Bool -> BV.BV w
 bitsToBV w bs = BV.mkBV w (foldl (\acc x -> if x then 1 + acc*2 else acc*2) 0 bs)
 
@@ -235,16 +236,16 @@ get = M (\s _ t -> t s s)
 set :: S t -> M t ()
 set s = M (\_ _ t -> t () s)
 
--- | The state of evaluating an Expr into an RME term
+-- | The state of evaluating an 'Expr' into an 'RME' term
 data S t = S
   { nextVar :: !Int -- ^ next fresh variable to be used with RME lit
   , nonceCache :: !(MapF (Nonce t) R') -- ^ previously translated w4 expressions
-  , abstracts :: !(MapF (Nonce t) UninterpFnData) -- ^ previously assigned function applications
+  , uninterps :: !(MapF (Nonce t) UninterpFnData) -- ^ uninterpreted function interpretations
   }
 
+-- | Type-information and point-wise definition of an uninterpreted function.
 data UninterpFnData tp where
   UninterpFnData ::
-    Assignment RMERepr args ->
     RMERepr ret ->
     Map (AbstractKey args) (R' ret) ->
     UninterpFnData (args ::> ret)
@@ -254,7 +255,7 @@ emptyS :: S t
 emptyS = S
   { nextVar = 0
   , nonceCache = MapF.empty
-  , abstracts = MapF.empty
+  , uninterps = MapF.empty
   }
 
 -- | Produce a fresh RME term
@@ -272,7 +273,7 @@ type family R (t :: W4.BaseType) where
   R W4.BaseBoolType = RME
   R (W4.BaseBVType n) = RMEV
 
--- | Newtype wrapper for 'R' type for use with 'MapF'
+-- | Newtype wrapper for the 't:R' type family for use with 'Assignment'
 newtype R' tp = R (R tp)
 
 -- | Representation type use to determine which RME representation is being used
@@ -293,7 +294,7 @@ cached nonce gen =
       Nothing ->
        do r <- gen
           s <- get
-          set s{ nonceCache = MapF.insert nonce (R r) (nonceCache s) }
+          set $! s{ nonceCache = MapF.insert nonce (R r) (nonceCache s) }
           pure r
 
 -- | A version of what4's SemiRingRepr that matches the semi-rings that this backend supports
@@ -349,30 +350,31 @@ evalNonceApp = \case
   W4.Annotation _ _ e -> evalExpr e
   W4.Forall{} -> fail "RME does not support 'Forall' quantifiers"
   W4.Exists{} -> fail "RME does not support 'Exists' quantifiers"
-  W4.ArrayFromFn{} -> fail "RME does not support uninterpreted 'ArrayFromFn' expressions"
-  W4.MapOverArrays{} -> fail "RME does not support uninterpreted 'MapOverArrays' expressions"
-  W4.ArrayTrueOnEntries{} -> fail "RME does not support uninterpreted 'ArrayTrueOnEntries' expressions"
+  W4.ArrayFromFn{} -> fail "RME does not support 'ArrayFromFn' expressions"
+  W4.MapOverArrays{} -> fail "RME does not support 'MapOverArrays' expressions"
+  W4.ArrayTrueOnEntries{} -> fail "RME does not support 'ArrayTrueOnEntries' expressions"
   W4.FnApp fn args ->
    do args' <- traverseFC (\x -> R <$> evalExpr x) args
       argTypes <- traverseFC evalTypeRepr (W4.symFnArgTypes fn)
       retType <- evalTypeRepr (W4.symFnReturnType fn)
       let nonce = W4.symFnId fn
       let key = AbstractKey argTypes args'
-      mb <- fmap (MapF.lookup nonce . abstracts) get
-      case mb of
-        Just (UninterpFnData argTs retT points) ->
+      mbOldFnData <- fmap (MapF.lookup nonce . uninterps) get
+
+      -- Allocate a new point in the uninterpreted function and add it to the existing ones
+      let allocatePoint points =
+           do r <- allocateVar =<< evalTypeRepr (W4.symFnReturnType fn)
+              s <- get
+              let newFnData = UninterpFnData retType (Map.insert key (R r) points)
+              set $! s{ uninterps = MapF.insert nonce newFnData (uninterps s) }
+              pure r
+
+      case mbOldFnData of
+        Just (UninterpFnData _ points) ->
           case Map.lookup key points of
             Just (R ret) -> pure ret
-            Nothing ->
-             do r <- allocateVar =<< evalTypeRepr (W4.symFnReturnType fn)
-                s <- get
-                set s{ abstracts = MapF.insert nonce (UninterpFnData argTs retT (Map.insert key (R r) points)) (abstracts s) }
-                pure r
-        Nothing ->
-         do r <- allocateVar =<< evalTypeRepr (W4.symFnReturnType fn)
-            s <- get
-            set s{ abstracts = MapF.insert nonce (UninterpFnData argTypes retType (Map.singleton key (R r))) (abstracts s) }
-            pure r
+            Nothing -> allocatePoint points
+        Nothing -> allocatePoint Map.empty
 
 -- | Allocates an unconstrainted RME term at the given type.
 allocateVar :: RMERepr tp -> M t (R tp)

@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, TypeFamilies, MonadComprehensions, ScopedTypeVariables #-}
+{-# LANGUAGE GADTs, TypeFamilies, ScopedTypeVariables #-}
 {-|
 Module      : Data.RME.What4
 Description : What4 solver adapter for the RME backend.
@@ -20,15 +20,15 @@ import Control.Monad (replicateM, ap, (<$!>))
 import Data.BitVector.Sized qualified as BV
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
-import Data.Parameterized
-        (TestEquality(testEquality), type (:~:)(Refl), traverseFC, (::>), Pair(..),
-         OrdF (compareF), OrderingF (..), lexCompareF, joinOrderingF, fromOrdering)
+import Data.Map (Map)
+import Data.Map qualified as Map
+import Data.Parameterized (traverseFC, (::>), Some (..))
 import Data.Parameterized.Context (Assignment, pattern Empty, pattern (:>))
 import Data.Parameterized.Context qualified as Ctx
 import Data.Parameterized.Map (MapF)
 import Data.Parameterized.Map qualified as MapF
 import Data.Parameterized.NatRepr ( NatRepr(..) )
-import Data.Parameterized.Nonce qualified as Nonce
+import Data.Parameterized.Nonce (Nonce)
 import Data.RME
 import Data.Vector qualified as V
 import What4.Expr.App qualified as W4
@@ -41,6 +41,8 @@ import What4.Interface qualified as W4
 import What4.SatResult qualified as W4
 import What4.SemiRing qualified as W4
 import What4.Solver
+import Debug.Trace (traceShow)
+import Data.Foldable (msum)
 
 rmeAdapter :: SolverAdapter st
 rmeAdapter =
@@ -67,40 +69,124 @@ rmeAdapterCheckSat _ logger asserts k =
           putStrLn e
           k W4.Unknown
       Right (rme, s) ->
-        case sat rme of
-          Nothing -> k (W4.Unsat ())
-          Just model ->
-           do let trueVars = IntSet.fromList [i | (i, True) <- model]
-                  evaluate = W4.GroundEvalFn (groundEval trueVars (nonceCache s))
-              if checkConsistent trueVars MapF.empty (MapF.toList (abstracts s))
-                then k (W4.Sat (evaluate, Nothing))
-                else k Unknown
+        case cegar rme (abstracts s) of
+          Nothing -> k (Unsat ())
+          Just trueVars ->
+           do let evaluate = W4.GroundEvalFn (groundEval trueVars (nonceCache s))
+              k (W4.Sat (evaluate, Nothing))
 
--- | The checks whether the point-wise definition of an uninterpreted function
--- was actually consistent in a satisfying model. It is possible that a
--- function can have different outputs for the same concrete inputs.
+-- | Counter-example guided abstraction refinement
 --
--- For example, if we find `f a` and `f b` in the term, the system
--- will assign each of those fresh variables not knowing if
--- `a` and `b` might eventually be equal.
-checkConsistent ::
-  IntSet {- ^ Variables assigned true in the satisfying model -} ->
-  MapF (ConcreteKey t) W4.GroundValueWrapper {- ^ Summary of previously checked function points -} ->
-  [Pair (AbstractKey t) R'] {- ^ List of defined points in the function -} ->
-  Bool
-checkConsistent _ _ [] = True
-checkConsistent trueVars seen (Pair (AbstractKey f argTys retTy args) v : rest) =
-  case MapF.lookup k' seen of
-    Nothing -> checkConsistent trueVars seen' rest
-    Just old -> same retTy old v' && checkConsistent trueVars seen rest
-  where
-    k' = ConcreteKey f argTys (Ctx.zipWith (evalR trueVars) argTys args)
-    v' = evalR trueVars retTy v
-    seen' = MapF.insert k' v' seen
+-- Given an RME term, compute a satisfying assigment for that term.
+-- Then check that the satisfying assignment generates
+cegar :: RME -> MapF (Nonce t) UninterpFnData -> Maybe IntSet
+cegar rme a =
+  case sat rme of
+    Nothing -> Nothing
+    Just model ->
+      let trueVars = IntSet.fromList [x | (x, True) <- model] in
+      case msum (fmap (findRefinement trueVars) (MapF.elems a)) of
+        Nothing -> Just trueVars
+        Just refinement ->
+          traceShow refinement (cegar (conj refinement rme) a)
 
-    same :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Bool
-    same BitRepr (W4.GVW x) (W4.GVW y) = x == y
-    same BVRepr{} (W4.GVW x) (W4.GVW y) = x == y
+-- | Search for a contradiction in the chosen interpretation of an
+-- uninterpreted function. Each of the points at which the function
+-- was defined are computed to ground values. If there is a contradiction
+-- in the current model for a pair of points, an RME term is returned
+-- that should have been true in a valid model.
+findRefinement ::
+  IntSet {- ^ Variables assigned true in the satisfying model -} ->
+  Some UninterpFnData {- ^ Defined points in the function -} ->
+  Maybe RME
+findRefinement trueVars (Some (UninterpFnData argTs retT points)) = go Map.empty (Map.toList points)
+  where
+    go _ [] = Nothing
+    go seen ((AbstractKey _ k, v) : rest) =
+      case Map.lookup k' seen of
+        Nothing -> go seen' rest
+        Just (old_k, old_v, old_v')
+          | gvwEq retT old_v' v' -> go seen rest
+          | otherwise -> Just (makeRefinement argTs old_k k retT old_v v)
+        where
+          k' = ConcreteKey argTs (Ctx.zipWith (evalR trueVars) argTs k)
+          v' = evalR trueVars retT v
+          seen' = Map.insert k' (k, v, v') seen
+
+-- | Equality of two ground value terms.
+gvwEq :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Bool
+gvwEq BitRepr (W4.GVW x) (W4.GVW y) = x == y
+gvwEq BVRepr{} (W4.GVW x) (W4.GVW y) = x == y
+
+-- | Literal equality of the symbolic boolean formulas. Two RME values
+-- are considered equal when they compute the same expression under all
+-- interpretations. Because RME keeps terms in a normal for, we can use
+-- derived equality to answer this question.
+rmeEq :: RMERepr a -> R' a -> R' a -> Bool
+rmeEq BitRepr (R x) (R y) = x == y
+rmeEq BVRepr{} (R x) (R y) = x == y
+
+data AbstractKey args where
+  AbstractKey ::
+    Assignment RMERepr args ->
+    Assignment R' args ->
+    AbstractKey args
+
+instance Eq (AbstractKey args) where
+  AbstractKey a b == AbstractKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Bool
+      go Empty Empty Empty = True
+      go (ts :> t) (xs :> x) (ys :> y) = rmeEq t x y && go ts xs ys
+
+instance Ord (AbstractKey args) where
+  AbstractKey a b `compare` AbstractKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Ordering
+      go Empty Empty Empty = EQ
+      go (ts :> t) (xs :> x) (ys :> y) = compareR t x y <> go ts xs ys
+
+      compareR :: RMERepr a -> R' a -> R' a -> Ordering
+      compareR BitRepr (R x) (R y) = compare x y
+      compareR BVRepr{} (R x) (R y) = compare x y
+
+data ConcreteKey args where
+  ConcreteKey ::
+    Assignment RMERepr args ->
+    Assignment W4.GroundValueWrapper args ->
+    ConcreteKey args
+
+instance Eq (ConcreteKey args) where
+  ConcreteKey a b == ConcreteKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Bool
+      go Empty Empty Empty = True
+      go (ts :> t) (xs :> x) (ys :> y) = gvwEq t x y && go ts xs ys
+
+instance Ord (ConcreteKey args) where
+  ConcreteKey a b `compare` ConcreteKey _ c = go a b c
+    where
+      go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Ordering
+      go Empty Empty Empty = EQ
+      go (ts :> t) (xs :> x) (ys :> y) = compareGVW t x y <> go ts xs ys
+
+      compareGVW :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Ordering
+      compareGVW BitRepr (W4.GVW x) (W4.GVW y) = compare x y
+      compareGVW BVRepr{} (W4.GVW x) (W4.GVW y) = compare x y
+
+makeRefinement ::
+  Assignment RMERepr a -> Assignment R' a -> Assignment R' a ->
+  RMERepr r -> R' r -> R' r ->
+  RME
+makeRefinement Empty Empty Empty rt rx ry = sameR rt rx ry
+makeRefinement (ts :> t) (xs :> x) (ys :> y) rt rx ry = sameR t x y ==> makeRefinement ts xs ys rt rx ry
+  where
+    p ==> q = compl p `disj` q
+
+-- | Computes the symbolic term that is true when the two arguments are equal
+sameR :: RMERepr a -> R' a -> R' a -> RME
+sameR BitRepr (R l) (R r) = conj l r
+sameR BVRepr{} (R l) (R r) = eq l r
 
 -- | Given a satisfying model, compute the ground value of an RME term.
 evalR :: IntSet -> RMERepr a -> R' a -> W4.GroundValueWrapper a
@@ -113,7 +199,7 @@ evalRME trueVars x = eval x (`IntSet.member` trueVars)
 
 -- | Ground evaluation function. Given a satisfying assignment (set of true variables)
 -- this function will used the cached results to evaluate an expression.
-groundEval :: IntSet -> MapF (Nonce.Nonce t) R' -> W4.Expr t tp -> IO (W4.GroundValue tp)
+groundEval :: IntSet -> MapF (Nonce t) R' -> W4.Expr t tp -> IO (W4.GroundValue tp)
 groundEval trueVars nonces e =
   case (flip MapF.lookup nonces =<< W4.exprMaybeId e, W4.exprType e) of
     (Just (R n), W4.BaseBoolRepr) -> pure $! evalRME trueVars n
@@ -154,76 +240,16 @@ set s = M (\_ _ t -> t () s)
 -- | The state of evaluating an Expr into an RME term
 data S t = S
   { nextVar :: !Int -- ^ next fresh variable to be used with RME lit
-  , nonceCache :: !(MapF (Nonce.Nonce t) R') -- ^ previously translated w4 expressions
-  , abstracts :: !(MapF (AbstractKey t) R') -- ^ previously assigned function applications
+  , nonceCache :: !(MapF (Nonce t) R') -- ^ previously translated w4 expressions
+  , abstracts :: !(MapF (Nonce t) UninterpFnData) -- ^ previously assigned function applications
   }
 
--- | The application of a uninterpreted function to arguments in the RME domain.
-data AbstractKey t ret where
-  AbstractKey ::
-    Nonce.Nonce t (args ::> ret) ->
+data UninterpFnData tp where
+  UninterpFnData ::
     Assignment RMERepr args ->
     RMERepr ret ->
-    Assignment R' args ->
-    AbstractKey t ret
-
-instance TestEquality (AbstractKey t) where
-  testEquality (AbstractKey f ts_ _ xs_) (AbstractKey g _ _ ys_) =
-    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_] -- Monad Maybe
-    where
-      same :: RMERepr a -> R a -> R a -> Bool
-      same BitRepr = (==)
-      same BVRepr{} = (==)
-
-      go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Maybe (a :~: a)
-      go Empty Empty Empty = Just Refl
-      go (ts :> t) (xs :> R x) (ys :> R y) =
-        [Refl | same t x y, Refl <- go ts xs ys] -- Monad Maybe
-
-instance OrdF (AbstractKey t) where
-  compareF (AbstractKey f ts_ _ xs_) (AbstractKey g _ _ ys_) =
-    lexCompareF f g (joinOrderingF (go ts_ xs_ ys_) EQF)
-    where
-      same :: RMERepr a -> R a -> R a -> OrderingF a a
-      same BitRepr x y = fromOrdering (compare x y)
-      same BVRepr{} x y = fromOrdering (compare x y)
-
-      go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> OrderingF a a
-      go Empty Empty Empty = EQF
-      go (ts :> t) (xs :> R x) (ys :> R y) = joinOrderingF (same t x y) (joinOrderingF (go ts xs ys) EQF)
-
--- | The application of a uninterpreted function to concrete arguments.
-data ConcreteKey t ret where
-  ConcreteKey ::
-    Nonce.Nonce t (args ::> ret) ->
-    Assignment RMERepr args ->
-    Assignment W4.GroundValueWrapper args ->
-    ConcreteKey t ret
-
-instance TestEquality (ConcreteKey t) where
-  testEquality (ConcreteKey f ts_ xs_) (ConcreteKey g _ ys_) =
-    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_] -- Monad Maybe
-    where
-      same :: RMERepr a -> W4.GroundValue a -> W4.GroundValue a -> Bool
-      same BitRepr = (==)
-      same BVRepr{} = (==)
-
-      go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Maybe (a :~: a)
-      go Empty Empty Empty = Just Refl
-      go (ts :> t) (xs :> W4.GVW x) (ys :> W4.GVW y) =
-        [Refl | same t x y, Refl <- go ts xs ys] -- Monad Maybe
-
-instance OrdF (ConcreteKey t) where
-  compareF (ConcreteKey f ts_ xs_) (ConcreteKey g _ ys_) =
-    lexCompareF f g (joinOrderingF (go ts_ xs_ ys_) EQF)
-    where
-      same :: RMERepr a -> W4.GroundValue a -> W4.GroundValue a -> OrderingF a a
-      same BitRepr x y = fromOrdering (compare x y)
-      same BVRepr{} x y = fromOrdering (compare x y)
-
-      go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> OrderingF a a
-      go Empty Empty Empty = EQF
-      go (ts :> t) (xs :> W4.GVW x) (ys :> W4.GVW y) = joinOrderingF (same t x y) (joinOrderingF (go ts xs ys) EQF)
+    Map (AbstractKey args) (R' ret) ->
+    UninterpFnData (args ::> ret)
 
 -- | The initial evaluation state
 emptyS :: S t
@@ -261,7 +287,7 @@ data RMERepr (t :: W4.BaseType) where
 -- | Helper for memoizing evaluation. Given a nonced and a way to evaluation
 -- action this will either return the cached value for that nonce or
 -- evaluate the given action and store it in the cache before returning it.
-cached :: Nonce.Nonce t tp -> M t (R tp) -> M t (R tp)
+cached :: Nonce t tp -> M t (R tp) -> M t (R tp)
 cached nonce gen =
  do mb <- fmap (MapF.lookup nonce . nonceCache) get
     case mb of
@@ -332,14 +358,22 @@ evalNonceApp = \case
    do args' <- traverseFC (\x -> R <$> evalExpr x) args
       argTypes <- traverseFC evalTypeRepr (W4.symFnArgTypes fn)
       retType <- evalTypeRepr (W4.symFnReturnType fn)
-      let key = AbstractKey (W4.symFnId fn) argTypes retType args'
-      mb <- fmap (MapF.lookup key . abstracts) get
+      let nonce = W4.symFnId fn
+      let key = AbstractKey argTypes args'
+      mb <- fmap (MapF.lookup nonce . abstracts) get
       case mb of
-        Just (R r) -> pure r
+        Just (UninterpFnData argTs retT points) ->
+          case Map.lookup key points of
+            Just (R ret) -> pure ret
+            Nothing ->
+             do r <- allocateVar =<< evalTypeRepr (W4.symFnReturnType fn)
+                s <- get
+                set s{ abstracts = MapF.insert nonce (UninterpFnData argTs retT (Map.insert key (R r) points)) (abstracts s) }
+                pure r
         Nothing ->
          do r <- allocateVar =<< evalTypeRepr (W4.symFnReturnType fn)
             s <- get
-            set s{ abstracts = MapF.insert key (R r) (abstracts s) }
+            set s{ abstracts = MapF.insert nonce (UninterpFnData argTypes retType (Map.singleton key (R r))) (abstracts s) }
             pure r
 
 -- | Allocates an unconstrainted RME term at the given type.

@@ -1,5 +1,4 @@
-{-# Language LambdaCase, GADTs, ImportQualifiedPost, BlockArguments, TypeFamilies, RankNTypes, PatternSynonyms, TypeOperators, MonadComprehensions #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE GADTs, TypeFamilies, MonadComprehensions, ScopedTypeVariables #-}
 {-|
 Module      : Data.RME.What4
 Description : What4 solver adapter for the RME backend.
@@ -21,7 +20,9 @@ import Control.Monad (replicateM, ap, (<$!>))
 import Data.BitVector.Sized qualified as BV
 import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
-import Data.Parameterized (TestEquality(..), TraversableFC(..), (::>), OrdF (compareF), OrderingF (..), type (:~:)(Refl), lexCompareF, joinOrderingF, fromOrdering, Pair (Pair))
+import Data.Parameterized
+        (TestEquality(testEquality), type (:~:)(Refl), traverseFC, (::>), Pair(..),
+         OrdF (compareF), OrderingF (..), lexCompareF, joinOrderingF, fromOrdering)
 import Data.Parameterized.Context (Assignment, pattern Empty, pattern (:>))
 import Data.Parameterized.Context qualified as Ctx
 import Data.Parameterized.Map (MapF)
@@ -51,6 +52,7 @@ rmeAdapter =
   }
 
 rmeAdapterCheckSat ::
+  forall t st fs a.
   W4.ExprBuilder t st fs ->
   LogData ->
   [W4.BoolExpr t] ->
@@ -64,7 +66,7 @@ rmeAdapterCheckSat _ logger asserts k =
        do logCallback logger e
           putStrLn e
           k W4.Unknown
-      Right (rme, s :: S t) ->
+      Right (rme, s) ->
         case sat rme of
           Nothing -> k (W4.Unsat ())
           Just model ->
@@ -78,9 +80,9 @@ rmeAdapterCheckSat _ logger asserts k =
 -- was actually consistent in a satisfying model. It is possible that a
 -- function can have different outputs for the same concrete inputs.
 --
--- For example, if we find `f a` and `f b` in the term the system
--- will assign each of those fresh variables not knowing if they
--- if `a` and `b` might eventually be equal.
+-- For example, if we find `f a` and `f b` in the term, the system
+-- will assign each of those fresh variables not knowing if
+-- `a` and `b` might eventually be equal.
 checkConsistent ::
   IntSet {- ^ Variables assigned true in the satisfying model -} ->
   MapF (ConcreteKey t) W4.GroundValueWrapper {- ^ Summary of previously checked function points -} ->
@@ -100,7 +102,7 @@ checkConsistent trueVars seen (Pair (AbstractKey f argTys retTy args) v : rest) 
     same BitRepr (W4.GVW x) (W4.GVW y) = x == y
     same BVRepr{} (W4.GVW x) (W4.GVW y) = x == y
 
--- | Given a satisfying model compute the ground value of an RME term.
+-- | Given a satisfying model, compute the ground value of an RME term.
 evalR :: IntSet -> RMERepr a -> R' a -> W4.GroundValueWrapper a
 evalR trueVars BitRepr (R x) = W4.GVW (evalRME trueVars x)
 evalR trueVars (BVRepr w) (R x) = W4.GVW (bitsToBV w (fmap (evalRME trueVars) x))
@@ -167,7 +169,7 @@ data AbstractKey t ret where
 
 instance TestEquality (AbstractKey t) where
   testEquality (AbstractKey f ts_ _ xs_) (AbstractKey g _ _ ys_) =
-    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_]
+    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_] -- Monad Maybe
     where
       same :: RMERepr a -> R a -> R a -> Bool
       same BitRepr = (==)
@@ -175,7 +177,8 @@ instance TestEquality (AbstractKey t) where
 
       go :: Assignment RMERepr a -> Assignment R' a -> Assignment R' a -> Maybe (a :~: a)
       go Empty Empty Empty = Just Refl
-      go (ts :> t) (xs :> R x) (ys :> R y) = [Refl | same t x y, Refl <- go ts xs ys]
+      go (ts :> t) (xs :> R x) (ys :> R y) =
+        [Refl | same t x y, Refl <- go ts xs ys] -- Monad Maybe
 
 instance OrdF (AbstractKey t) where
   compareF (AbstractKey f ts_ _ xs_) (AbstractKey g _ _ ys_) =
@@ -199,7 +202,7 @@ data ConcreteKey t ret where
 
 instance TestEquality (ConcreteKey t) where
   testEquality (ConcreteKey f ts_ xs_) (ConcreteKey g _ ys_) =
-    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_]
+    [Refl | Refl <- testEquality f g, Refl <- go ts_ xs_ ys_] -- Monad Maybe
     where
       same :: RMERepr a -> W4.GroundValue a -> W4.GroundValue a -> Bool
       same BitRepr = (==)
@@ -207,7 +210,8 @@ instance TestEquality (ConcreteKey t) where
 
       go :: Assignment RMERepr a -> Assignment W4.GroundValueWrapper a -> Assignment W4.GroundValueWrapper a -> Maybe (a :~: a)
       go Empty Empty Empty = Just Refl
-      go (ts :> t) (xs :> W4.GVW x) (ys :> W4.GVW y) = [Refl | same t x y, Refl <- go ts xs ys]
+      go (ts :> t) (xs :> W4.GVW x) (ys :> W4.GVW y) =
+        [Refl | same t x y, Refl <- go ts xs ys] -- Monad Maybe
 
 instance OrdF (ConcreteKey t) where
   compareF (ConcreteKey f ts_ xs_) (ConcreteKey g _ ys_) =

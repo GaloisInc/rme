@@ -41,7 +41,6 @@ import What4.Interface qualified as W4
 import What4.SatResult qualified as W4
 import What4.SemiRing qualified as W4
 import What4.Solver
-import Debug.Trace (traceShow)
 import Data.Foldable (msum)
 
 rmeAdapter :: SolverAdapter st
@@ -87,8 +86,7 @@ cegar rme a =
       let trueVars = IntSet.fromList [x | (x, True) <- model] in
       case msum (fmap (findRefinement trueVars) (MapF.elems a)) of
         Nothing -> Just trueVars
-        Just refinement ->
-          traceShow refinement (cegar (conj refinement rme) a)
+        Just refinement -> cegar (conj refinement rme) a
 
 -- | Search for a contradiction in the chosen interpretation of an
 -- uninterpreted function. Each of the points at which the function

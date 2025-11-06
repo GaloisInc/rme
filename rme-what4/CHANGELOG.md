@@ -4,6 +4,6 @@
 
 * Added support for uninterpreted functions
 
-## 0.1 -- TBA
+## 0.1
 
 * First version.

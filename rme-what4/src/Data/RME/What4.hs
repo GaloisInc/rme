@@ -23,7 +23,7 @@ import Data.IntSet (IntSet)
 import Data.IntSet qualified as IntSet
 import Data.Map (Map)
 import Data.Map qualified as Map
-import Data.Parameterized (traverseFC, (::>), Some (..))
+import Data.Parameterized (traverseFC, (::>), Some (..), OrdF (compareF), OrderingF (..), lexCompareF)
 import Data.Parameterized.Context (Assignment, pattern Empty, pattern (:>))
 import Data.Parameterized.Context qualified as Ctx
 import Data.Parameterized.Map (MapF)
@@ -79,7 +79,7 @@ rmeAdapterCheckSat _ logger asserts k =
 --
 -- Given an RME term, compute a satisfying assigment for that term.
 -- Then check that the satisfying assignment generates
-cegar :: RME -> MapF (Nonce t) UninterpFnData -> Maybe IntSet
+cegar :: RME -> MapF k UninterpFnData -> Maybe IntSet
 cegar rme a =
   case sat rme of
     Nothing -> Nothing
@@ -116,6 +116,7 @@ findRefinement trueVars (Some (UninterpFnData retT points)) = go Map.empty (Map.
 gvwEq :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Bool
 gvwEq BitRepr (W4.GVW x) (W4.GVW y) = x == y
 gvwEq BVRepr{} (W4.GVW x) (W4.GVW y) = x == y
+gvwEq IntRepr (W4.GVW x) (W4.GVW y) = x == y 
 
 -- | Literal equality of the symbolic boolean formulas. Two RME values
 -- are considered equal when they compute the same expression under all
@@ -124,6 +125,7 @@ gvwEq BVRepr{} (W4.GVW x) (W4.GVW y) = x == y
 rmeEq :: RMERepr a -> R' a -> R' a -> Bool
 rmeEq BitRepr (R x) (R y) = x == y
 rmeEq BVRepr{} (R x) (R y) = x == y
+rmeEq IntRepr (R x) (R y) = x == y
 
 data AbstractKey args where
   AbstractKey ::
@@ -148,6 +150,7 @@ instance Ord (AbstractKey args) where
       compareR :: RMERepr a -> R' a -> R' a -> Ordering
       compareR BitRepr (R x) (R y) = compare x y
       compareR BVRepr{} (R x) (R y) = compare x y
+      compareR IntRepr (R x) (R y) = compare x y
 
 data ConcreteKey args where
   ConcreteKey ::
@@ -172,6 +175,7 @@ instance Ord (ConcreteKey args) where
       compareGVW :: RMERepr a -> W4.GroundValueWrapper a -> W4.GroundValueWrapper a -> Ordering
       compareGVW BitRepr (W4.GVW x) (W4.GVW y) = compare x y
       compareGVW BVRepr{} (W4.GVW x) (W4.GVW y) = compare x y
+      compareGVW IntRepr (W4.GVW x) (W4.GVW y) = compare x y
 
 makeRefinement ::
   Assignment RMERepr a -> Assignment R' a -> Assignment R' a ->
@@ -186,11 +190,13 @@ makeRefinement (ts :> t) (xs :> x) (ys :> y) rt rx ry = sameR t x y ==> makeRefi
 sameR :: RMERepr a -> R' a -> R' a -> RME
 sameR BitRepr (R l) (R r) = conj l r
 sameR BVRepr{} (R l) (R r) = eq l r
+sameR IntRepr (R l) (R r) = constant (l == r)
 
 -- | Given a satisfying model, compute the ground value of an RME term.
 evalR :: IntSet -> RMERepr a -> R' a -> W4.GroundValueWrapper a
 evalR trueVars BitRepr (R x) = W4.GVW (evalRME trueVars x)
 evalR trueVars (BVRepr w) (R x) = W4.GVW (bitsToBV w (fmap (evalRME trueVars) x))
+evalR _ IntRepr (R x) = W4.GVW x
 
 -- | Evaluate an RME term given the set of true variables.
 evalRME :: IntSet -> RME -> Bool
@@ -240,8 +246,25 @@ set s = M (\_ _ t -> t () s)
 data S t = S
   { nextVar :: !Int -- ^ next fresh variable to be used with RME lit
   , nonceCache :: !(MapF (Nonce t) R') -- ^ previously translated w4 expressions
-  , uninterps :: !(MapF (Nonce t) UninterpFnData) -- ^ uninterpreted function interpretations
+  , uninterps :: !(MapF (FnKey t) UninterpFnData) -- ^ uninterpreted function interpretations
   }
+
+data FnKey t as where
+  FnKey    :: Nonce t args -> FnKey t args
+  FnArrKey :: Nonce t (args Ctx.::> W4.BaseArrayType i e) -> FnKey t (args Ctx.<+> i Ctx.::> e)
+
+instance W4.TestEquality (FnKey t) where
+  testEquality (FnKey x) (FnKey y) = W4.testEquality x y
+  testEquality (FnArrKey x) (FnArrKey y) | Just W4.Refl <- W4.testEquality x y = Just W4.Refl
+  testEquality _ _ = Nothing
+
+instance OrdF (FnKey t) where
+  compareF (FnKey x) (FnKey y) = compareF x y
+  compareF (FnArrKey x) (FnArrKey y) = lexCompareF x y EQF
+  compareF FnKey{} FnArrKey{} = LTF
+  compareF FnArrKey{} FnKey{} = GTF
+  
+  
 
 -- | Type-information and point-wise definition of an uninterpreted function.
 data UninterpFnData tp where
@@ -272,6 +295,7 @@ freshRME =
 type family R (t :: W4.BaseType) where
   R W4.BaseBoolType = RME
   R (W4.BaseBVType n) = RMEV
+  R W4.BaseIntegerType = Integer
 
 -- | Newtype wrapper for the 't:R' type family for use with 'Assignment'
 newtype R' tp = R (R tp)
@@ -282,7 +306,9 @@ data RMERepr (t :: W4.BaseType) where
   BitRepr :: RMERepr W4.BaseBoolType
   -- | A vector of w RME bits
   BVRepr  :: !(NatRepr w) -> RMERepr (W4.BaseBVType w)
-
+  -- | An integer
+  IntRepr :: RMERepr W4.BaseIntegerType
+  
 -- | Helper for memoizing evaluation. Given a nonced and a way to evaluation
 -- action this will either return the cached value for that nonce or
 -- evaluate the given action and store it in the cache before returning it.
@@ -299,7 +325,8 @@ cached nonce gen =
 
 -- | A version of what4's SemiRingRepr that matches the semi-rings that this backend supports
 data SemiRingRepr sr where
-  SemiRingRepr :: !(W4.BVFlavorRepr fv) -> !Int -> SemiRingRepr (W4.SemiRingBV fv w)
+  SemiRingBVRepr :: !(W4.BVFlavorRepr fv) -> !Int -> SemiRingRepr (W4.SemiRingBV fv w)
+  SemiRingIntRepr :: SemiRingRepr W4.SemiRingInteger
 
 -- | Converts a BV width into the Int type used by Vector.
 -- In the extreme case that the NatRepr is out of range of
@@ -317,17 +344,18 @@ evalTypeRepr :: W4.BaseTypeRepr tp -> M t (RMERepr tp)
 evalTypeRepr = \case
   W4.BaseBoolRepr -> pure BitRepr
   W4.BaseBVRepr w -> pure $! BVRepr w
+  W4.BaseIntegerRepr -> pure IntRepr
   r -> fail ("RME does not support " ++ show r)
 
 -- | Convert a generic what4 semiring type to an RME semiring type.
 -- Reports an error for unsupported semiring types.
 evalSemiRingRepr :: W4.SemiRingRepr sr -> M t (SemiRingRepr sr)
 evalSemiRingRepr = \case
-      W4.SemiRingIntegerRepr -> fail "RME does not support integers"
+      W4.SemiRingIntegerRepr -> pure SemiRingIntRepr
       W4.SemiRingRealRepr -> fail "RME does not support real numbers"
       W4.SemiRingBVRepr flv w ->
        do w' <- evalWidth w
-          pure $! SemiRingRepr flv w'
+          pure $! SemiRingBVRepr flv w'
 
 -- | Evaluate an expression, if possible, into an RME term.
 evalExpr :: W4.Expr t tp -> M t (R tp)
@@ -336,9 +364,10 @@ evalExpr = \case
   W4.AppExpr x -> cached (W4.appExprId x) (evalApp (W4.appExprApp x))
   W4.BoundVarExpr x -> cached (W4.bvarId x) (allocateVar =<< evalTypeRepr (W4.bvarType x))
   W4.SemiRingLiteral rpr c _ ->
-   do SemiRingRepr _ w <- evalSemiRingRepr rpr
-      case c of
-        BV.BV ci -> pure $! integer w ci
+   do rpr' <- evalSemiRingRepr rpr
+      pure $! case rpr' of
+        SemiRingBVRepr _ w | BV.BV ci <- c -> integer w ci
+        SemiRingIntRepr -> c
   W4.FloatExpr{} -> fail "RME does not support floating point numbers"
   W4.StringExpr{} -> fail "RME does not support string literals"
   W4.NonceAppExpr x -> cached (W4.nonceExprId x) (evalNonceApp (W4.nonceExprApp x))
@@ -357,7 +386,7 @@ evalNonceApp = \case
    do args' <- traverseFC (\x -> R <$> evalExpr x) args
       argTypes <- traverseFC evalTypeRepr (W4.symFnArgTypes fn)
       retType <- evalTypeRepr (W4.symFnReturnType fn)
-      let nonce = W4.symFnId fn
+      let nonce = FnKey (W4.symFnId fn)
       let key = AbstractKey argTypes args'
       mbOldFnData <- fmap (MapF.lookup nonce . uninterps) get
 
@@ -383,6 +412,7 @@ allocateVar = \case
   BVRepr w ->
    do w' <- evalWidth w
       V.fromList <$!> replicateM w' freshRME
+  IntRepr -> fail "RME does not support symbolic Integers"
 
 -- | Convert a what4 App into an RME term for the operations that the
 -- RME backend supports.
@@ -396,15 +426,18 @@ evalApp = \case
       pure $! case r of
         BitRepr -> iff x1 y1
         BVRepr{} -> eq x1 y1
+        IntRepr -> constant (x1 == y1)
 
   W4.BaseIte rpr _ b t e ->
    do b1 <- evalExpr b
       t1 <- evalExpr t
       e1 <- evalExpr e
       r <- evalTypeRepr rpr
-      pure $! case r of
-        BitRepr -> mux b1 t1 e1
-        BVRepr{} -> V.zipWith (mux b1) t1 e1
+      case r of
+        BitRepr -> pure $! mux b1 t1 e1
+        BVRepr{} -> pure $! V.zipWith (mux b1) t1 e1
+        IntRepr ->
+          if t1 == e1 then pure t1 else fail "Can not mux integers"
 
   W4.NotPred x ->
    do x1 <- evalExpr x
@@ -499,52 +532,72 @@ evalApp = \case
       pure (V.replicate l (V.head v') <> v')
 
   W4.SemiRingSum s ->
-   do SemiRingRepr flv w <- evalSemiRingRepr (Sum.sumRepr s)
-
-      case flv of
-        -- modular addition
-        W4.BVArithRepr ->
+   do rpr <- evalSemiRingRepr (Sum.sumRepr s)
+      case rpr of
+        SemiRingIntRepr ->
           Sum.evalM
-            (\x y -> pure $! add x y)
-            (\(BV.BV c) r ->
-             do v <- evalExpr r
-                pure $! mul v (integer w c))
-            (\(BV.BV c) -> pure $! integer w c)
+            (\x y -> pure $! x + y)
+            (\c r ->
+             do r' <- evalExpr r
+                pure $! c * r')
+            (\c   -> pure c)
             s
 
-        -- bitwise xor
-        W4.BVBitsRepr ->
-          Sum.evalM
-            (\x y -> pure $! V.zipWith xor x y)
-            (\(BV.BV c) r ->
-             do v <- evalExpr r
-                pure $! V.zipWith conj (integer w c) v)
-            (\(BV.BV c) -> pure $! integer w c)
-            s
+        SemiRingBVRepr flv w ->
+          case flv of
+            -- modular addition
+            W4.BVArithRepr ->
+              Sum.evalM
+                (\x y -> pure $! add x y)
+                (\(BV.BV c) r ->
+                 do v <- evalExpr r
+                    pure $! mul v (integer w c))
+                (\(BV.BV c) -> pure $! integer w c)
+                s
+
+            -- bitwise xor
+            W4.BVBitsRepr ->
+              Sum.evalM
+                (\x y -> pure $! V.zipWith xor x y)
+                (\(BV.BV c) r ->
+                 do v <- evalExpr r
+                    pure $! V.zipWith conj (integer w c) v)
+                (\(BV.BV c) -> pure $! integer w c)
+                s
 
   W4.SemiRingProd p ->
-   do SemiRingRepr flv w <- evalSemiRingRepr (Sum.prodRepr p)
-
-      case flv of
-      -- arithmetic multiplication
-        W4.BVArithRepr ->
+   do rpr <- evalSemiRingRepr (Sum.prodRepr p)
+      case rpr of
+        SemiRingIntRepr ->
          do mb <- Sum.prodEvalM
-              (\x y -> pure $! mul x y)
-              evalExpr
-              p
-            pure $! case mb of
-              Nothing -> integer w 1
-              Just r -> r
-
-        -- bitwise conjunction
-        W4.BVBitsRepr ->
-         do mb <- Sum.prodEvalM
-                  (\x y -> pure $! V.zipWith conj x y)
+                  (\x y -> pure $! x * y)
                   evalExpr
                   p
             pure $! case mb of
-              Nothing -> V.replicate w true -- ~0
+              Nothing -> 1
               Just r -> r
+
+        SemiRingBVRepr flv w ->
+          case flv of
+          -- arithmetic multiplication
+            W4.BVArithRepr ->
+             do mb <- Sum.prodEvalM
+                  (\x y -> pure $! mul x y)
+                  evalExpr
+                  p
+                pure $! case mb of
+                  Nothing -> integer w 1
+                  Just r -> r
+    
+            -- bitwise conjunction
+            W4.BVBitsRepr ->
+             do mb <- Sum.prodEvalM
+                      (\x y -> pure $! V.zipWith conj x y)
+                      evalExpr
+                      p
+                pure $! case mb of
+                  Nothing -> V.replicate w true -- ~0
+                  Just r -> r
 
   W4.BVUdiv _ x y ->
    do x' <- evalExpr x
@@ -576,4 +629,45 @@ evalApp = \case
       u' <- UnaryBV.evaluate constEval u
       pure $! integer w' u'
 
+  -- This translation allows us to treat uninterpreted functions with the shape:
+  --
+  --   Args -> Array Indexes Elt
+  --
+  -- as if they were actually:
+  --
+  --   Args -> Indexes -> Elt
+  --
+  -- Expressions of the form @select (FnApp f args) ixs@ are generated
+  -- by SAW when it is processing uninterpreted functions in order
+  -- to reduce the number of uninterpreted function applications. This means
+  -- we never actually need to construct the array itself; we treat it
+  -- as though it was just an extension of the uninterpreted function.
+  W4.SelectArray retType (W4.NonceAppExpr nae) ixs ->
+    case W4.nonceExprApp nae of
+      W4.FnApp fn args ->
+       do args' <- traverseFC (\x -> R <$> evalExpr x) args
+          ixs'  <- traverseFC (\x -> R <$> evalExpr x) ixs
+          argTypes <- traverseFC evalTypeRepr (W4.symFnArgTypes fn)
+          let indexTypes = W4.arrayTypeIndices (W4.symFnReturnType fn)
+          indexTypes' <- traverseFC evalTypeRepr indexTypes
+          retType' <- evalTypeRepr retType
+          let nonce = FnArrKey (W4.symFnId fn)
+          let key = AbstractKey (argTypes Ctx.<++> indexTypes') (args' Ctx.<++> ixs')
+          mbOldFnData <- fmap (MapF.lookup nonce . uninterps) get
+    
+          -- Allocate a new point in the uninterpreted function and add it to the existing ones
+          let allocatePoint points =
+               do r <- allocateVar retType'
+                  s <- get
+                  let newFnData = UninterpFnData retType' (Map.insert key (R r) points)
+                  set $! s{ uninterps = MapF.insert nonce newFnData (uninterps s) }
+                  pure r
+    
+          case mbOldFnData of
+            Just (UninterpFnData _ points) ->
+              case Map.lookup key points of
+                Just (R ret) -> pure ret
+                Nothing -> allocatePoint points
+            Nothing -> allocatePoint Map.empty
+      _ -> fail "select only implemented for arrays emitted from symbolic functions"
   e -> fail ("RME does not support " ++ show e)

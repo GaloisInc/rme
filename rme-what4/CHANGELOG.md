@@ -1,5 +1,7 @@
 # Revision history for rme-what4
 
+## next
+
 ## 0.1.2 -- 2026-01-26
 
 * Synchronize with `rme` release.

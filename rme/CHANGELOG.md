@@ -1,5 +1,7 @@
 # Revision history for rme
 
+## next
+
 ## 0.1.2 -- 2026-01-26
 
 * Added partial support for arrays returned from symbolic functions.

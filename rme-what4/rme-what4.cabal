@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               rme-what4
-version:            0.1.1.99
+version:            0.1.2
 synopsis:           What4 adapter for the RME solver
 license:            BSD-3-Clause
 license-file:       LICENSE

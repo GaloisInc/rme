@@ -2,6 +2,8 @@
 
 ## next
 
+* Support building with `parameterized-utils` 2.3.
+
 ## 0.1.2 -- 2026-01-26
 
 * Added partial support for arrays returned from symbolic functions.

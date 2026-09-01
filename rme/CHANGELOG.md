@@ -1,5 +1,7 @@
 # Revision history for rme
 
+## next
+
 ## 0.1.3 -- 2026-09-01
 
 * Support building with `parameterized-utils` 2.3.

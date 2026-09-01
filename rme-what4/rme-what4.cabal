@@ -8,6 +8,7 @@ author:             Eric Mertens
 maintainer:         emertens@galois.com
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
+category:           Formal Methods
 copyright:          2025 Galois
 description:
     This package provides an adapter for what4 to support

@@ -34,4 +34,4 @@ library
     Data.RME.Base
     Data.RME.Vector
 
-  ghc-options: -O2 -Wall -Wcompat -fno-ignore-asserts -fno-spec-constr-count
+  ghc-options: -Wall -Wcompat -fno-ignore-asserts -fno-spec-constr-count

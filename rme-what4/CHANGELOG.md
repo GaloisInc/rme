@@ -2,6 +2,10 @@
 
 ## next
 
+## 0.1.3 -- 2026-09-01
+
+* Synchronize with `rme` release.
+
 ## 0.1.2 -- 2026-01-26
 
 * Synchronize with `rme` release.

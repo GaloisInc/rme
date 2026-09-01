@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               rme-what4
-version:            0.1.2.0.99
+version:            0.1.3.0.99
 synopsis:           What4 adapter for the RME solver
 license:            BSD-3-Clause
 license-file:       LICENSE
@@ -8,6 +8,7 @@ author:             Eric Mertens
 maintainer:         emertens@galois.com
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
+category:           Formal Methods
 copyright:          2025 Galois
 description:
     This package provides an adapter for what4 to support

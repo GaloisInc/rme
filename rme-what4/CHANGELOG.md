@@ -2,6 +2,8 @@
 
 ## next
 
+* Support building with `what4` 1.8.
+
 ## 0.1.3 -- 2026-09-01
 
 * Synchronize with `rme` release.
